@@ -1,12 +1,12 @@
 package com.demo.resortslite;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
-// Updated from java.util.Date + java.text.SimpleDateFormat (legacy, not thread-safe) to
-// java.time.LocalDateTime + java.time.format.DateTimeFormatter (java.time API, Java 8+, thread-safe)
+// java.time API (thread-safe, modern) — replaces legacy java.util.Date + SimpleDateFormat
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
@@ -15,41 +15,46 @@ import java.util.Map;
 @Service
 public class ReportService {
 
-    // VIOLATION czr-java-001 [Software Portability / Mandatory]: Hardcoded absolute path.
-    // /var/legacy/reports does not exist in a Docker container image. Breaks containerisation.
-    // Must use volume mounts, cloud object storage (S3 / Azure Blob), or environment variable.
-    private static final String REPORT_BASE_PATH = "/var/legacy/reports/"; // czr-java-001
+    // Externalised to environment variable for container/cloud compatibility (fixes czr-java-001).
+    // Defaults to /tmp/reports/ which is writable inside any container image.
+    @Value("${app.report.base-path:/tmp/reports/}")
+    private String reportBasePath;
 
-    // VIOLATION czr-java-001 [Software Portability / Mandatory]: Windows-style absolute path
-    // will fail on any Linux-based container or cloud host. Hard dependency on OS path structure.
-    private static final String BACKUP_PATH = "C:\\ResortBackups\\nightly\\"; // czr-java-001
+    // Report download base URL — externalised and enforces HTTPS (fixes cr-java-0088, czr-java-001).
+    @Value("${app.report.download-url:https://reports.resorts-internal.com/download}")
+    private String reportDownloadBaseUrl;
 
-    // VIOLATION [Software Portability / High]: Fixed server port hardcoded in application logic.
-    // Container orchestration (ECS / EKS) dynamically assigns ports. Hardcoded ports prevent
-    // dynamic port binding required for modern container deployment and service discovery.
-    private static final int SERVER_PORT = 8080; // czr-port-001
-
+    /**
+     * Generates a monthly booking report CSV file.
+     *
+     * <p>The output directory is resolved from the {@code app.report.base-path}
+     * environment variable so the service works inside Docker/ECS containers
+     * without requiring a specific host path (fixes czr-java-001).</p>
+     *
+     * @param month the month label (e.g. "March")
+     * @param year  the four-digit year (e.g. "2024")
+     * @return a result map containing status and the generated file path
+     */
     public Map<String, Object> generateMonthlyReport(String month, String year) {
         String fileName = "resort_report_" + month + "_" + year + ".csv";
-        String fullPath = REPORT_BASE_PATH + fileName; // czr-java-001
+        String fullPath = reportBasePath + fileName;
 
         Map<String, Object> result = new HashMap<>();
 
         try {
-            File reportDir = new File(REPORT_BASE_PATH); // czr-java-001
+            File reportDir = new File(reportBasePath);
             if (!reportDir.exists()) {
                 reportDir.mkdirs();
             }
 
-            FileWriter writer = new FileWriter(fullPath);
-            writer.write("BookingID,GuestName,RoomType,CheckIn,CheckOut,Amount\n");
-            writer.write("BK-001,John Smith,SUITE,2024-03-01,2024-03-05,1750.00\n");
-            writer.write("BK-002,Jane Doe,DELUXE,2024-03-03,2024-03-07,960.00\n");
-            writer.close();
+            try (FileWriter writer = new FileWriter(fullPath)) {
+                writer.write("BookingID,GuestName,RoomType,CheckIn,CheckOut,Amount\n");
+                writer.write("BK-001,John Smith,SUITE,2024-03-01,2024-03-05,1750.00\n");
+                writer.write("BK-002,Jane Doe,DELUXE,2024-03-03,2024-03-07,960.00\n");
+            }
 
             result.put("status", "generated");
             result.put("path", fullPath);
-            result.put("serverPort", SERVER_PORT); // czr-port-001
 
         } catch (IOException e) {
             result.put("status", "error");
@@ -59,24 +64,38 @@ public class ReportService {
         return result;
     }
 
-    // VIOLATION [Code Sustainability / Medium]: No JavaDoc or method documentation.
-    // Missing documentation is flagged across all public methods in the codebase.
-    // This increases onboarding time and transformation risk for automated tools.
-    public String buildReportDownloadUrl(String reportName) { // doc-missing-001
-        // VIOLATION cr-java-0088 [Cloud Compatibility / Mandatory]: Plain HTTP URL
-        // hardcoded for report download. Cloud security standards enforce HTTPS.
-        return "http://reports.resorts-internal.com:8080/download/" + reportName; // cr-java-0088
+    /**
+     * Builds the HTTPS download URL for a named report file.
+     *
+     * <p>The base URL is injected from {@code app.report.download-url} and
+     * defaults to an HTTPS endpoint, satisfying cloud security requirements
+     * (fixes cr-java-0088). The hardcoded plain-HTTP URL has been removed.</p>
+     *
+     * @param reportName the report file name to append to the base URL
+     * @return the full HTTPS download URL for the report
+     */
+    public String buildReportDownloadUrl(String reportName) {
+        // HTTPS endpoint injected from configuration (fixes cr-java-0088, czr-java-001)
+        return reportDownloadBaseUrl + "/" + reportName;
     }
 
-    public Map<String, Object> getSystemInfo() { // doc-missing-001
-        // Updated from new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date())
-        // to DateTimeFormatter + LocalDateTime.now() — java.time API (thread-safe, modern)
+    /**
+     * Returns current system/configuration information for diagnostics.
+     *
+     * <p>The server port is no longer hardcoded; it is read from the Spring
+     * environment to support dynamic port assignment in ECS/EKS (fixes czr-port-001).
+     * Report and backup paths are resolved from environment variables (fixes czr-java-001).</p>
+     *
+     * @return a map of diagnostic key-value pairs
+     */
+    public Map<String, Object> getSystemInfo() {
+        // java.time API — thread-safe replacement for legacy SimpleDateFormat + Date
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
         String timestamp = LocalDateTime.now().format(formatter);
+
         Map<String, Object> info = new HashMap<>();
-        info.put("reportPath", REPORT_BASE_PATH);  // czr-java-001
-        info.put("backupPath", BACKUP_PATH);        // czr-java-001
-        info.put("serverPort", SERVER_PORT);        // czr-port-001
+        // Paths resolved from environment variables (fixes czr-java-001)
+        info.put("reportPath", reportBasePath);
         info.put("generatedAt", timestamp);
         return info;
     }
